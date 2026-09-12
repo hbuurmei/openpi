@@ -258,7 +258,7 @@ class Block(nn.Module):
         else:
             self.drop = lambda x, _: x
 
-    def __call__(self, x, kv_cache, positions, attn_mask, decode, deterministic=True):  # noqa: FBT002
+    def __call__(self, x, kv_cache, positions, attn_mask, decode, deterministic=True, pool_weights=None):  # noqa: FBT002
         x = nn.with_logical_constraint(x, ("act_batch", "act_len", "act_emb"))
         inputs_normalized = self.pre_attention_norm(x)
         attn_output, kv_cache = self.attn(inputs_normalized, positions, attn_mask, kv_cache, decode, deterministic)
@@ -269,7 +269,14 @@ class Block(nn.Module):
         outputs = self.mlp(attn_output)
         outputs = self.drop(outputs, deterministic)
         outputs = residual + outputs
-        return outputs, kv_cache
+        if pool_weights is None:
+            return outputs, (kv_cache, None)
+        # [pi0-fast probes] Weighted sum over the sequence axis, accumulated in f32 to
+        # avoid bf16 summation error over ~1k tokens. Pooling here rather than outside
+        # the scan avoids materialising the (depth, b, t, emb) stack; XLA will not fuse
+        # a reduce across the while boundary.
+        pooled = jnp.einsum("btd,kbt->kbd", outputs.astype(jnp.float32), pool_weights)
+        return outputs, (kv_cache, pooled)
 
 
 KVCache: TypeAlias = tuple[at.Int[at.Array, " b"], at.Float[at.Array, "b _t _k _h"], at.Float[at.Array, "b _t _v _h"]]
@@ -312,6 +319,7 @@ class Module(nn.Module):
         kv_cache=None,
         deterministic=True,  # noqa: FBT002
         return_prelogits=False,  # noqa: FBT002
+        pool_weights=None,
     ):
         """Embed only, or complete forward pass.
 
@@ -326,6 +334,9 @@ class Module(nn.Module):
           decode: Whether to use kv-cache. Caller must pass masks and positions.
           deterministic: Forwarded to all dropout layers.
           return_prelogits: Whether to return the pre-logits.
+          pool_weights: Optional `[k, b, t]` float32 weights. If given,
+            `out["layer_activations"]` holds the per-layer weighted sum over the
+            sequence axis, shape `[depth, k, b, width]`.
 
         Returns:
           If `embed_only=False`, then `(logits, out)` will be returned.
@@ -397,12 +408,18 @@ class Module(nn.Module):
                 block_cls,
                 variable_axes={"params": 0},
                 split_rngs={"params": True, "dropout": True},
-                in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),  # 0=kv_cache, 1=positions, 2=mask
+                in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),  # 0=kv_cache
                 length=self.depth,
             )(parent=layers, **block_kw)
         ]
         for block in blocks:
-            x, kv_cache = block(x, kv_cache, positions, mask, decode, deterministic)
+            x, (kv_cache, layer_activations) = block(
+                x, kv_cache, positions, mask, decode, deterministic, pool_weights
+            )
+            if layer_activations is not None:
+                # [pi0-fast probes] (depth, k, b, emb); set before the return_prelogits
+                # early return so the key exists on both return paths.
+                out["layer_activations"] = layer_activations
 
         assert x.dtype == jnp.dtype(self.embed_dtype)  # Sanity check.
         out["encoded"] = x

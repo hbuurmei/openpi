@@ -311,3 +311,64 @@ class Pi0FAST(_model.BaseModel):
             cond, step, (rng, last_logit, output_tokens, kv_cache, False, 0)
         )
         return output_tokens
+
+    @at.typecheck
+    def prefill_activations(
+        self,
+        observation: _model.Observation,
+        *,
+        masked_pool: bool = True,
+    ) -> at.Float[at.Array, "b l emb"]:
+        """Per-layer pooled prefill hidden states, for offline probe analysis.
+
+        Mirrors the prefill in ``sample_actions`` but skips the decode loop entirely --
+        probe features only need the prefix representation. Deliberately a separate
+        method rather than a flag on ``sample_actions``: that returns ``Actions`` per
+        ``BaseModel`` and ``Policy.infer`` tree-maps over it, so widening its return type
+        would break the serving path.
+
+        Args:
+          observation: batched observation, same as ``sample_actions`` takes.
+          masked_pool: if True, average over valid prefix positions only. If False,
+            average over the whole padded prefix, matching what ``CollectionHook`` does
+            for the pi0.5 PyTorch path (a bare ``mean(dim=1)``). Padding is ~14% of the
+            pi0-FAST prefix; those rows are not zero, since a fully masked query row gets
+            a uniform softmax and so contributes roughly the mean of all value vectors.
+
+        Returns:
+          ``[batch, depth, width]`` float32 pooled activations, one row per layer.
+        """
+        observation = _model.preprocess_observation(
+            None, observation, train=False, image_keys=list(observation.images.keys())
+        )
+
+        prefix_token_embeddings, prefix_mask, prefix_ar_mask = self.embed_inputs(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_token_embeddings, prefix_mask, prefix_attn_mask = left_to_right_align(
+            prefix_token_embeddings, prefix_mask, prefix_attn_mask
+        )
+        prefix_positions = jnp.cumsum(prefix_mask, axis=-1) - 1
+
+        weights = (
+            prefix_mask.astype(jnp.float32)
+            if masked_pool
+            else jnp.ones(prefix_mask.shape, dtype=jnp.float32)
+        )
+        # clip guards an all-padding row; weights sum to 1 so a constant perturbation
+        # passes through the pooling unchanged (this is what keeps the min-norm
+        # projection in LinearController pooling-agnostic).
+        weights = weights / jnp.clip(jnp.sum(weights, axis=-1, keepdims=True), 1.0)
+
+        # return_prelogits=True is required, not an optimisation: otherwise the module
+        # decodes the whole prefix against a 257k vocab (~8.4 GB at batch 16) and OOMs.
+        # decode=True only satisfies the positions/mask assert in gemma_fast.
+        _, _, out = self.PaliGemma.llm(
+            embedded_prefix=prefix_token_embeddings,
+            mask=prefix_attn_mask,
+            positions=prefix_positions,
+            decode=True,
+            return_prelogits=True,
+            pool_weights=weights[jnp.newaxis],  # (k=1, b, t)
+        )
+        # (depth, k=1, b, emb) -> (b, depth, emb)
+        return jnp.squeeze(out["layer_activations"], axis=1).swapaxes(0, 1)
