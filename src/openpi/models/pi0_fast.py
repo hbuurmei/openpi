@@ -262,12 +262,20 @@ class Pi0FAST(_model.BaseModel):
         # pad attention mask to set the size of the KV cache (prefill_size + max_decoding_steps)
         prefix_attn_mask = jnp.pad(prefix_attn_mask, ((0, 0), (0, 0), (0, max_decoding_steps)))
         prefix_positions = jnp.cumsum(prefix_mask, axis=-1) - 1
-        prefix_logits, kv_cache, _ = self.PaliGemma.llm(
-            embedded_prefix=prefix_token_embeddings, mask=prefix_attn_mask, positions=prefix_positions, decode=True
+        # Only the final prefix position's logit is used below, so ask for pre-logits and
+        # decode that one row. Decoding the whole prefix costs b * prefill_size * vocab:
+        # 3.6 GiB at batch 8 for LIBERO (948 tokens, 257k vocab, bf16), which OOMs any
+        # batched use. Numerically identical -- embedder.decode is per-position.
+        prefix_pre_logits, kv_cache, _ = self.PaliGemma.llm(
+            embedded_prefix=prefix_token_embeddings,
+            mask=prefix_attn_mask,
+            positions=prefix_positions,
+            decode=True,
+            return_prelogits=True,
         )
 
         # prepare decoding -- final logit decodes the first token
-        last_logit = prefix_logits[:, -1:]
+        last_logit, _ = self.PaliGemma.llm(pre_logits=prefix_pre_logits[:, -1:])
         output_tokens = jnp.zeros((last_logit.shape[0], max_decoding_steps))
 
         def step(carry):
