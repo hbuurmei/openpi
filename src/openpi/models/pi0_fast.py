@@ -279,7 +279,7 @@ class Pi0FAST(_model.BaseModel):
         output_tokens = jnp.zeros((last_logit.shape[0], max_decoding_steps))
 
         def step(carry):
-            rng, last_logit, output_tokens, cache, _, step = carry
+            rng, last_logit, output_tokens, cache, done, step = carry
 
             # Sample token from last logit
             # Split RNG for this step
@@ -290,11 +290,18 @@ class Pi0FAST(_model.BaseModel):
                 lambda _: jnp.argmax(last_logit, axis=-1),
                 operand=None,
             )
+            # Rows that already emitted EOS write 0 from here on, so their tail is zeros --
+            # exactly what they would contain had the loop exited for them individually.
+            # Without this, batch>1 keeps appending real tokens past a row's EOS and the
+            # trailing junk corrupts FASTTokenizer.extract_actions.
+            token = jnp.where(done[:, None], 0, token)
             output_tokens = put_along_last_axis(output_tokens, jnp.broadcast_to(step, (token.shape[0], 1)), token)
 
-            # Check for early stopping --> stop if all batch elements have EOS token
-            has_eos = jnp.any(token == PALIGEMMA_EOS_TOKEN, axis=-1)
-            all_eos = jnp.all(has_eos)
+            # Early stopping: accumulate per-row EOS and stop once every row is done.
+            # Checking only the current step (jnp.all of a per-step has_eos) requires all
+            # rows to emit EOS simultaneously, which is fine at batch 1 but never happens
+            # for a real batch -- so the loop would always run max_decoding_steps.
+            done = done | jnp.any(token == PALIGEMMA_EOS_TOKEN, axis=-1)
 
             # Decode one step
             token_embedding = self.PaliGemma.llm(token, embed_only=True)
@@ -308,15 +315,17 @@ class Pi0FAST(_model.BaseModel):
                 embedded_prefix=token_embedding, mask=mask, positions=positions, decode=True, kv_cache=cache
             )
 
-            return rng, last_logit, output_tokens, kv_cache, all_eos, step + 1
+            return rng, last_logit, output_tokens, kv_cache, done, step + 1
 
         def cond(carry):
-            _, _, _, _, all_eos, step = carry
-            return (~all_eos) & (step < max_decoding_steps)
+            _, _, _, _, done, step = carry
+            return (~jnp.all(done)) & (step < max_decoding_steps)
 
         # Use lax.while_loop so we can jit the full decoding loop.
         _, _, output_tokens, _, _, _ = jax.lax.while_loop(
-            cond, step, (rng, last_logit, output_tokens, kv_cache, False, 0)
+            cond,
+            step,
+            (rng, last_logit, output_tokens, kv_cache, jnp.zeros(last_logit.shape[0], dtype=bool), 0),
         )
         return output_tokens
 
@@ -325,8 +334,8 @@ class Pi0FAST(_model.BaseModel):
         self,
         observation: _model.Observation,
         *,
-        masked_pool: bool = True,
-    ) -> at.Float[at.Array, "b l emb"]:
+        poolings: tuple[str, ...] = ("masked",),
+    ) -> at.Float[at.Array, "b k l emb"]:
         """Per-layer pooled prefill hidden states, for offline probe analysis.
 
         Mirrors the prefill in ``sample_actions`` but skips the decode loop entirely --
@@ -337,15 +346,22 @@ class Pi0FAST(_model.BaseModel):
 
         Args:
           observation: batched observation, same as ``sample_actions`` takes.
-          masked_pool: if True, average over valid prefix positions only. If False,
-            average over the whole padded prefix, matching what ``CollectionHook`` does
-            for the pi0.5 PyTorch path (a bare ``mean(dim=1)``). Padding is ~14% of the
-            pi0-FAST prefix; those rows are not zero, since a fully masked query row gets
-            a uniform softmax and so contributes roughly the mean of all value vectors.
+          poolings: which pooling conventions to compute, in output order. ``"masked"``
+            averages over valid prefix positions only; ``"mean"`` averages over the whole
+            padded prefix, matching what ``CollectionHook`` does for the pi0.5 PyTorch path
+            (a bare ``mean(dim=1)``). Padding is ~14% of the pi0-FAST prefix and those rows
+            are not zero -- a fully masked query row gets a uniform softmax, so it
+            contributes roughly the mean of all value vectors. Computing several in one call
+            shares the prefill, which is the expensive part.
 
         Returns:
-          ``[batch, depth, width]`` float32 pooled activations, one row per layer.
+          ``[batch, len(poolings), depth, width]`` float32 pooled activations.
         """
+        if not poolings:
+            raise ValueError("poolings must be non-empty")
+        unknown = set(poolings) - {"masked", "mean"}
+        if unknown:
+            raise ValueError(f"unknown pooling(s): {sorted(unknown)}")
         observation = _model.preprocess_observation(
             None, observation, train=False, image_keys=list(observation.images.keys())
         )
@@ -357,11 +373,13 @@ class Pi0FAST(_model.BaseModel):
         )
         prefix_positions = jnp.cumsum(prefix_mask, axis=-1) - 1
 
-        weights = (
+        rows = [
             prefix_mask.astype(jnp.float32)
-            if masked_pool
+            if kind == "masked"
             else jnp.ones(prefix_mask.shape, dtype=jnp.float32)
-        )
+            for kind in poolings
+        ]
+        weights = jnp.stack(rows)  # (k, b, t)
         # clip guards an all-padding row; weights sum to 1 so a constant perturbation
         # passes through the pooling unchanged (this is what keeps the min-norm
         # projection in LinearController pooling-agnostic).
@@ -376,7 +394,7 @@ class Pi0FAST(_model.BaseModel):
             positions=prefix_positions,
             decode=True,
             return_prelogits=True,
-            pool_weights=weights[jnp.newaxis],  # (k=1, b, t)
+            pool_weights=weights,
         )
-        # (depth, k=1, b, emb) -> (b, depth, emb)
-        return jnp.squeeze(out["layer_activations"], axis=1).swapaxes(0, 1)
+        # (depth, k, b, emb) -> (b, k, depth, emb)
+        return jnp.transpose(out["layer_activations"], (2, 1, 0, 3))
