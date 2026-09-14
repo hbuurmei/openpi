@@ -240,7 +240,20 @@ class Pi0FAST(_model.BaseModel):
         *,
         max_decoding_steps: int | at.Int[at.Array, ""] = 256,
         temperature: float = 0.0,
+        prefix_steer: at.Float[at.Array, "l emb"] | None = None,
     ) -> _model.Actions:
+        """Greedy FAST-token decode.
+
+        ``prefix_steer`` is an optional ``[depth, width]`` additive perturbation applied
+        to each block's output during the *prefill* pass only, for steering analysis. The
+        decode steps are deliberately left unsteered: the perturbation still reaches them
+        through the prefix KV cache they attend to, but their own hidden states are
+        untouched. That matches ``SteeringHook._hook_output``'s ``shape[1] <= 1`` guard on
+        the torch models, and matches what the probes were fit on -- pooled *prefill*
+        activations.
+
+        Inert when None: the prefill is bit-identical, so the serving path is unaffected.
+        """
         # TODO: this is a hack to get the image keys.
         observation = _model.preprocess_observation(
             None, observation, train=False, image_keys=list(observation.images.keys())
@@ -272,6 +285,7 @@ class Pi0FAST(_model.BaseModel):
             positions=prefix_positions,
             decode=True,
             return_prelogits=True,
+            steer=prefix_steer,
         )
 
         # prepare decoding -- final logit decodes the first token

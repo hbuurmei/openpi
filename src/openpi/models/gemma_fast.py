@@ -258,7 +258,7 @@ class Block(nn.Module):
         else:
             self.drop = lambda x, _: x
 
-    def __call__(self, x, kv_cache, positions, attn_mask, decode, deterministic=True, pool_weights=None):  # noqa: FBT002
+    def __call__(self, x, kv_cache, positions, attn_mask, decode, deterministic=True, pool_weights=None, steer=None):  # noqa: FBT002
         x = nn.with_logical_constraint(x, ("act_batch", "act_len", "act_emb"))
         inputs_normalized = self.pre_attention_norm(x)
         attn_output, kv_cache = self.attn(inputs_normalized, positions, attn_mask, kv_cache, decode, deterministic)
@@ -269,6 +269,13 @@ class Block(nn.Module):
         outputs = self.mlp(attn_output)
         outputs = self.drop(outputs, deterministic)
         outputs = residual + outputs
+        if steer is not None:
+            # [pi0-fast steering] Additive per-layer perturbation, (emb,) broadcast over
+            # (batch, seq). Applied after the residual so it is the block's output that
+            # shifts -- the same place SteeringHook(target="output") acts on the torch
+            # models. Appended after `pool_weights` so nn.remat(static_argnums=(5, 6))
+            # keeps pointing at decode/deterministic.
+            outputs = outputs + steer.astype(outputs.dtype)
         if pool_weights is None:
             return outputs, (kv_cache, None)
         # [pi0-fast probes] Weighted sum over the sequence axis, accumulated in f32 to
@@ -320,6 +327,7 @@ class Module(nn.Module):
         deterministic=True,  # noqa: FBT002
         return_prelogits=False,  # noqa: FBT002
         pool_weights=None,
+        steer=None,
     ):
         """Embed only, or complete forward pass.
 
@@ -337,6 +345,8 @@ class Module(nn.Module):
           pool_weights: Optional `[k, b, t]` float32 weights. If given,
             `out["layer_activations"]` holds the per-layer weighted sum over the
             sequence axis, shape `[depth, k, b, width]`.
+          steer: Optional `[depth, width]` additive perturbation, one row per layer,
+            added to that block's output and broadcast over batch and sequence.
 
         Returns:
           If `embed_only=False`, then `(logits, out)` will be returned.
@@ -408,13 +418,14 @@ class Module(nn.Module):
                 block_cls,
                 variable_axes={"params": 0},
                 split_rngs={"params": True, "dropout": True},
-                in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),  # 0=kv_cache
+                # 0=kv_cache, last=steer (one row per layer); everything else broadcast.
+                in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast, 0),
                 length=self.depth,
             )(parent=layers, **block_kw)
         ]
         for block in blocks:
             x, (kv_cache, layer_activations) = block(
-                x, kv_cache, positions, mask, decode, deterministic, pool_weights
+                x, kv_cache, positions, mask, decode, deterministic, pool_weights, steer
             )
             if layer_activations is not None:
                 # [pi0-fast probes] (depth, k, b, emb); set before the return_prelogits
