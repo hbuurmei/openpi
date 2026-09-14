@@ -349,6 +349,7 @@ class Pi0FAST(_model.BaseModel):
         observation: _model.Observation,
         *,
         poolings: tuple[str, ...] = ("masked",),
+        steer: at.Float[at.Array, "l emb"] | None = None,
     ) -> at.Float[at.Array, "b k l emb"]:
         """Per-layer pooled prefill hidden states, for offline probe analysis.
 
@@ -367,6 +368,10 @@ class Pi0FAST(_model.BaseModel):
             are not zero -- a fully masked query row gets a uniform softmax, so it
             contributes roughly the mean of all value vectors. Computing several in one call
             shares the prefill, which is the expensive part.
+          steer: optional ``[depth, width]`` perturbation, same semantics as
+            ``sample_actions``' ``prefix_steer``. Lets a caller read the *steered*
+            representation, which is what separates "the perturbation moved the
+            representation" from "the perturbation moved the emitted action".
 
         Returns:
           ``[batch, len(poolings), depth, width]`` float32 pooled activations.
@@ -409,6 +414,7 @@ class Pi0FAST(_model.BaseModel):
             decode=True,
             return_prelogits=True,
             pool_weights=weights,
+            steer=steer,
         )
         # (depth, k, b, emb) -> (b, k, depth, emb)
         return jnp.transpose(out["layer_activations"], (2, 1, 0, 3))
